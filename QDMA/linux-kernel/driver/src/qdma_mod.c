@@ -1586,7 +1586,7 @@ static int probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 	conf.qsets_max = 0;
 	conf.qsets_base = -1;
 	conf.msix_qvec_max = 32;
-	conf.user_msix_qvec_max = 1;
+	conf.user_msix_qvec_max = 3;
 #ifdef __QDMA_VF__
 	conf.fp_flr_free_resource = qdma_flr_resource_free;
 #endif
