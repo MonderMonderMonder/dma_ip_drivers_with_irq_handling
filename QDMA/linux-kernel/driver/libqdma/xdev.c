@@ -42,9 +42,6 @@
 #ifdef DEBUGFS
 #include "qdma_debugfs_dev.h"
 #endif
-#ifdef __XRT__
-#include "qdma_access_errors.h"
-#endif
 
 #ifdef __LIST_NEXT_ENTRY__
 #define list_next_entry(pos, member) \
@@ -538,7 +535,6 @@ static int xdev_map_bars(struct xlnx_dma_dev *xdev, struct pci_dev *pdev)
 static int xdev_identify_bars(struct xlnx_dma_dev *xdev, struct pci_dev *pdev)
 {
 	int bar_idx = 0;
-	int rv = 0;
 	u8 num_bars_present = 0;
 	int bar_id_list[QDMA_BAR_NUM];
 	int bar_id_idx = 0;
@@ -557,6 +553,7 @@ static int xdev_identify_bars(struct xlnx_dma_dev *xdev, struct pci_dev *pdev)
 	}
 
 	if (num_bars_present > 1) {
+		int rv = 0;
 
 		/* AXI Master Lite BAR IDENTIFICATION */
 		if ((xdev->version_info.ip_type == QDMA_VERSAL_HARD_IP) &&
@@ -578,14 +575,7 @@ static int xdev_identify_bars(struct xlnx_dma_dev *xdev, struct pci_dev *pdev)
 		if (rv < 0) {
 			pr_err("get AXI Master Lite bar failed with error = %d",
 					rv);
-#ifdef __XRT__
-			/** This change is for XRT application,
-			 * when there is no user BAR in desin
-			 */
-			rv = QDMA_ERR_HWACC_BAR_NOT_FOUND;
-#else
 			return xdev->hw.qdma_get_error_code(rv);
-#endif
 		}
 
 		pr_info("AXI Master Lite BAR %d.\n",
@@ -608,7 +598,7 @@ static int xdev_identify_bars(struct xlnx_dma_dev *xdev, struct pci_dev *pdev)
 			}
 		}
 	}
-	return rv;
+	return 0;
 }
 
 /*****************************************************************************/
@@ -1177,7 +1167,7 @@ int qdma_device_open(const char *mod_name, struct qdma_dev_conf *conf,
 	}
 
 	rv = xdev_identify_bars(xdev, pdev);
-	if (rv < 0) {
+	if (rv) {
 		pr_err("Failed to identify bars, err %d", rv);
 		goto unmap_bars;
 	}
@@ -1195,7 +1185,7 @@ int qdma_device_open(const char *mod_name, struct qdma_dev_conf *conf,
 
 	*dev_hndl = (unsigned long)xdev;
 
-	return rv;
+	return 0;
 
 cleanup_qdma:
 	qdma_device_offline(pdev, (unsigned long)xdev, XDEV_FLR_INACTIVE);

@@ -197,7 +197,6 @@ int intr_legacy_setup(struct qdma_descq *descq);
  *****************************************************************************/
 void intr_legacy_clear(struct qdma_descq *descq);
 
-
 /*****************************************************************************/
 /**
  * intr_work() - attach the top half for the interrupt

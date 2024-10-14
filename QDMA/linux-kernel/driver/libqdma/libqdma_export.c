@@ -2650,7 +2650,7 @@ ssize_t qdma_batch_request_submit(unsigned long dev_hndl, unsigned long id,
 int qdma_init_st_ctxt(unsigned long dev_hndl, char *buf, int buflen)
 {
 	struct xlnx_dma_dev *xdev = (struct xlnx_dma_dev *)dev_hndl;
-	int rv = 0;
+	int rv;
 
 	/** make sure that input buffer is not empty, else return error */
 	if (!buf || !buflen) {
@@ -2672,8 +2672,7 @@ int qdma_init_st_ctxt(unsigned long dev_hndl, char *buf, int buflen)
 	}
 
 	if ((xdev->version_info.ip_type == QDMA_VERSAL_HARD_IP) &&
-		((xdev->version_info.device_type == QDMA_DEVICE_VERSAL_CPM4) ||
-		(xdev->version_info.device_type == QDMA_DEVICE_VERSAL_CPM5))) {
+		(xdev->version_info.device_type == QDMA_DEVICE_VERSAL_CPM5)) {
 		if (xdev->hw.qdma_init_st_ctxt == NULL) {
 			pr_err("Err: Feature not supported\n");
 			snprintf(buf, buflen, "Err: Feature not supported\n");

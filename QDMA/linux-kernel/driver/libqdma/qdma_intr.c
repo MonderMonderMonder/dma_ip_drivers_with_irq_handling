@@ -20,6 +20,13 @@
 #define pr_fmt(fmt)	KBUILD_MODNAME ":%s: " fmt, __func__
 
 #include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/io.h>
+#include <linux/interrupt.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
+#include <linux/delay.h>
 #include "qdma_descq.h"
 #include "qdma_device.h"
 #include "qdma_regs.h"
@@ -27,10 +34,420 @@
 #include "version.h"
 #include "qdma_mbox_protocol.h"
 #include "qdma_intr.h"
-#ifdef DUMP_ON_ERROR_INTERRUPT
-#include "qdma_reg_dump.h"
-#endif
 #include "qdma_access_common.h"
+
+static off_t GIRQ_BASE_ADDR = 0x101000; // interrupt generation registers base address
+
+// interrupt generation register pointers
+static void __iomem *reg_girq_ctrl; 
+static void __iomem *reg_girq_trig; 
+static void __iomem *reg_girq_stat;
+static void __iomem *reg_girq_cmpt; 
+static void __iomem *reg_girq_ts0;
+static void __iomem *reg_girq_ts1;
+static void __iomem *reg_girq_ts2;
+static void __iomem *reg_girq_counter;
+
+static struct pci_dev *pdev; // PCIe device
+static void __iomem *bar2; // BAR pointer
+
+// Initializes memory-mapped registers
+static int mm_registers_init(void) {
+	unsigned long bar_start, bar_len;
+	// get PCIe device based on vendor
+	pdev = pci_get_device((uint16_t)(0x10ee), PCI_ANY_ID, NULL); 
+	if (!pdev) { // device not found
+		pr_err("1"); 
+		return -1;
+	}
+	// initialize PCIe device memory space
+	if (pci_enable_device_mem(pdev)) { 
+		pr_err("2");
+		return -1;
+	}
+
+	// set PCIe flags
+	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN); // relaxed ordering
+	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_EXT_TAG); // extended tag field
+	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_NOSNOOP_EN); // no snoop transactions
+	// pcie_capability_set_word(pdev, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_ASPM_L0S); // active state power management
+	// pcie_capability_set_word(pdev, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_ASPM_L1); // L1 state, power-saving
+
+	pci_set_master(pdev); // set device to bus master
+	// if (!dma_set_mask(pdev, DMA_BIT_MASK(64))) dma_set_mask_and_coherent(pdev, DMA_BIT_MASK(64));
+	// else if (!dma_set_mask(pdev, DMA_BIT_MASK(32))) dma_set_mask_and_coherent(pdev, DMA_BIT_MASK(32));
+	// else return -1;
+
+	// map BAR2 to kernel virtual address space
+	bar_start = pci_resource_start(pdev, 2);
+    bar_len = pci_resource_len(pdev, 2);
+    bar2 = ioremap(bar_start, bar_len);
+    if (!bar2) {
+        pci_release_region(pdev, 2); // release BAR2 if ioremap fails
+        pci_disable_device(pdev);
+        return -1;
+    }
+
+	// initialize interrupt generation register pointers
+	reg_girq_ctrl = bar2 + GIRQ_BASE_ADDR + 0*4;
+	reg_girq_trig = bar2 + GIRQ_BASE_ADDR + 1*4;
+	reg_girq_stat = bar2 + GIRQ_BASE_ADDR + 2*4;
+	reg_girq_cmpt = bar2 + GIRQ_BASE_ADDR + 3*4;
+	reg_girq_ts0 = bar2 + GIRQ_BASE_ADDR + 4*4;
+	reg_girq_ts1 = bar2 + GIRQ_BASE_ADDR + 5*4;
+	reg_girq_ts2 = bar2 + GIRQ_BASE_ADDR + 6*4; 
+	reg_girq_counter = bar2 + GIRQ_BASE_ADDR + 6*4;
+    return 0;
+}
+
+// Releases PCIe resources
+static void mm_registers_teardown(void) {
+	iounmap(bar2);
+    pci_release_region(pdev, 2);
+    pci_disable_device(pdev);
+}
+
+
+// Top Half: simple completion signal write
+static irqreturn_t top(int irq, void *dev) {
+	iowrite32(0X1, reg_girq_cmpt);
+	return IRQ_HANDLED; 
+}
+
+// Top Half: indefinetly busy-wait and monopolize CPU
+static irqreturn_t top_busy(int irq, void *dev) {
+	unsigned long start_jiffies = jiffies;
+	while (time_before(jiffies, start_jiffies + HZ * 30)) cpu_relax();
+	iowrite32(0X1, reg_girq_cmpt);
+	return IRQ_HANDLED; 
+}
+
+
+// Top Half: wake up Threaded Handler (BH)
+static irqreturn_t threaded_top(int irq, void *dev) {
+	return IRQ_WAKE_THREAD; 
+}
+
+// Bottom Half: Threaded Handler
+static irqreturn_t threaded_bottom(int irq, void *dev) {
+	iowrite32(0X1, reg_girq_cmpt); // write completion signal
+	return IRQ_HANDLED; 
+}
+
+
+static struct tasklet_struct tk1, tk2;
+
+// Top Half: schedule Tasklet BH
+static irqreturn_t tasklet_top(int irq, void *dev_id) {
+	tasklet_schedule(&tk1);
+	return IRQ_HANDLED; 
+}
+
+// Top Half: schedule high priority Tasklet (BH)
+static irqreturn_t tasklet_hi_top(int irq, void *dev_id) {
+	tasklet_hi_schedule(&tk2);
+	return IRQ_HANDLED; 
+}
+
+// Bottom Half: (high priority) Tasklet
+static void tasklet_func(unsigned long data) {
+    iowrite32(0X1, reg_girq_cmpt);
+}
+
+// Bottom Half: indefinetly busy-waiting (high priority) Tasklet, can be stopped by Top Half
+static void tasklet_func_busy(unsigned long data) {
+	unsigned long start_jiffies = jiffies;
+    while (time_before(jiffies, start_jiffies + HZ * 30)) cpu_relax();
+    iowrite32(0X1, reg_girq_cmpt);
+}
+
+
+static struct workqueue_struct *wq1, *wq2, *wq3, *wq4, *wq5;
+static struct work_struct *work; // wrapper
+
+// Top Half: enqueue Work into Workqueue (BH)
+
+static irqreturn_t wq1_top(int irq, void *dev) {
+	queue_work(wq1, work);
+	return IRQ_HANDLED; 
+}
+
+static irqreturn_t wq2_top(int irq, void *dev) {
+	queue_work(wq2, work);
+	return IRQ_HANDLED; 
+}
+
+static irqreturn_t wq3_top(int irq, void *dev) {
+	queue_work(wq3, work);
+	return IRQ_HANDLED; 
+}
+
+static irqreturn_t wq4_top(int irq, void *dev) {
+	queue_work(wq4, work);
+	return IRQ_HANDLED; 
+}
+
+static irqreturn_t wq5_top(int irq, void *dev) {
+	queue_work(wq5, work);
+	return IRQ_HANDLED; 
+}
+
+// Bottom Half: Work to be enqueued in Workqueue 
+static void w_func(struct work_struct *work) {
+    iowrite32(0X1, reg_girq_cmpt);
+}
+
+// Register IRQ for MSI-X vector indexed by idx, with ISR of type type 
+static int usr_intr_vector_init(struct xlnx_dma_dev *xdev, int idx, enum intr_type_list type) {
+	int rv;
+	snprintf(xdev->dev_intr_info_list[idx].msix_name, QDMA_DEV_NAME_MAXLEN + 16, "%s-user", xdev->conf.name);
+
+	// initialize BH structs
+	work = kzalloc(sizeof(struct work_struct), GFP_ATOMIC);
+	INIT_WORK(work, w_func); // wrap simple function with Work struct 
+
+	switch (type) {
+		case INTR_TYPE_USER_TOP: // Top Half without Bottom Half
+			rv = request_irq(xdev->msix[idx].vector, top, 0, xdev->dev_intr_info_list[idx].msix_name, 0);
+			break;
+		case INTR_TYPE_USER_THREADED:
+			rv = request_threaded_irq(xdev->msix[idx].vector, threaded_top, threaded_bottom, 0, xdev->dev_intr_info_list[idx].msix_name, 0);
+			break;
+		case INTR_TYPE_USER_TASKLET:
+			tasklet_init(&tk1, tasklet_func_busy, 0);
+			rv = request_irq(xdev->msix[idx].vector, tasklet_top, 0, xdev->dev_intr_info_list[idx].msix_name, 0);
+			break;
+		case INTR_TYPE_USER_TASKLET_HIGHPRI:
+			tasklet_init(&tk2, tasklet_func, 0);
+			rv = request_irq(xdev->msix[idx].vector, tasklet_hi_top, 0, xdev->dev_intr_info_list[idx].msix_name, 0);
+			break;
+		case INTR_TYPE_USER_WQ: // refer to Workqueue API https://docs.kernel.org/core-api/workqueue.html#flags
+			wq1 = alloc_workqueue("wq1", 0, 1);
+			if (!wq1) pr_debug("Failed at creating INTR_TYPE_USER_WQ"); 
+			rv = request_irq(xdev->msix[idx].vector, wq1_top, 0, xdev->dev_intr_info_list[idx].msix_name, 0);
+			break;
+		case INTR_TYPE_USER_WQ_UNBOUND: 
+			wq2 = alloc_workqueue("wq2", WQ_UNBOUND, 1);
+			if (!wq2) pr_debug("Failed at creating INTR_TYPE_USER_WQ_UNBOUND"); 
+			rv = request_irq(xdev->msix[idx].vector, wq2_top, 0, xdev->dev_intr_info_list[idx].msix_name, 0);
+			break;
+		case INTR_TYPE_USER_WQ_HIGHPRI:
+			wq3 = alloc_workqueue("wq3", WQ_HIGHPRI, 1);
+			if (!wq3) pr_debug("Failed at creating INTR_TYPE_USER_WQ_HIGHPRI"); 
+			rv = request_irq(xdev->msix[idx].vector, wq3_top, 0, xdev->dev_intr_info_list[idx].msix_name, 0);
+			break;
+		case INTR_TYPE_USER_WQ_UNBOUND_HIGHPRI:
+			wq4 = alloc_workqueue("wq4", WQ_UNBOUND | WQ_HIGHPRI, 1);
+			if (!wq4) pr_debug("Failed at creating INTR_TYPE_USER_WQ_UNBOUND_HIGHPRI"); 
+			rv = request_irq(xdev->msix[idx].vector, wq4_top, 0, xdev->dev_intr_info_list[idx].msix_name, 0);
+			break;
+		case INTR_TYPE_USER_WQ_CPUINTENSIVE:
+			wq5 = alloc_workqueue("wq5", WQ_CPU_INTENSIVE, 1);
+			if (!wq5) pr_debug("Failed at creating INTR_TYPE_USER_WQ_CPUINTENSIVE"); 
+			rv = request_irq(xdev->msix[idx].vector, wq5_top, 0, xdev->dev_intr_info_list[idx].msix_name, 0);
+			break;
+		// Can only be used for Kernel >= 6.9:
+		case INTR_TYPE_USER_WQ_BH:
+			break;
+		case INTR_TYPE_USER_WQ_BH_HIGHPRI:
+			break;
+		// TODO: Alternative to IRQ Affinity at Workqueue level, see https://docs.kernel.org/core-api/workqueue.html#affinity-scopes
+		case INTR_TYPE_USER_WQ_UNBOUND_AFFNT_CPU_STRICT: 
+		case INTR_TYPE_USER_WQ_UNBOUND_AFFNT_SMT_STRICT:
+		case INTR_TYPE_USER_WQ_UNBOUND_AFFNT_CACHE_STRICT:
+		case INTR_TYPE_USER_WQ_UNBOUND_AFFNT_NUMA_STRICT:
+		case INTR_TYPE_USER_WQ_ORDERED:
+			break;
+		default:
+			pr_warn("Unhandled interrupt type in initialization: %d\n", type);
+	}
+	// log IRQ request
+	pr_debug("%s requesting IRQ vector #%d: vec %d, type %d, %s.\n", xdev->conf.name, idx, xdev->msix[idx].vector, type, xdev->dev_intr_info_list[idx].msix_name);
+	if (rv) pr_err("%s requesting IRQ vector #%d: vec %d failed %d.\n", xdev->conf.name, idx, xdev->msix[idx].vector, rv);
+	return rv;
+}
+
+// Free IRQs and their allocated resources
+static void usr_intr_vector_teardown(enum intr_type_list type) {
+	switch (type) {
+		case INTR_TYPE_USER_TASKLET:
+			tasklet_kill(&tk1);
+			break;
+		case INTR_TYPE_USER_TASKLET_HIGHPRI:
+			tasklet_kill(&tk2);
+			break;
+		case INTR_TYPE_USER_WQ:
+			flush_workqueue(wq1);
+			destroy_workqueue(wq1);
+			break;
+		case INTR_TYPE_USER_WQ_UNBOUND:
+			flush_workqueue(wq2);
+			destroy_workqueue(wq2);
+			break;
+		case INTR_TYPE_USER_WQ_HIGHPRI:
+			flush_workqueue(wq3);
+			destroy_workqueue(wq3);
+			break;
+		case INTR_TYPE_USER_WQ_UNBOUND_HIGHPRI:
+			flush_workqueue(wq4);
+			destroy_workqueue(wq4);
+			break;
+		case INTR_TYPE_USER_WQ_CPUINTENSIVE:
+			flush_workqueue(wq5);
+			destroy_workqueue(wq5);
+			break;
+		case INTR_TYPE_USER_WQ_BH:
+		case INTR_TYPE_USER_WQ_BH_HIGHPRI:
+		case INTR_TYPE_USER_WQ_UNBOUND_AFFNT_CPU_STRICT:
+		case INTR_TYPE_USER_WQ_UNBOUND_AFFNT_SMT_STRICT:
+		case INTR_TYPE_USER_WQ_UNBOUND_AFFNT_CACHE_STRICT:
+		case INTR_TYPE_USER_WQ_UNBOUND_AFFNT_NUMA_STRICT:
+		case INTR_TYPE_USER_WQ_ORDERED:
+			break;
+		default:
+			pr_warn("Unhandled interrupt type in teardown: %d\n", type);
+	}
+}
+
+
+int intr_setup(struct xlnx_dma_dev *xdev) {
+	int rv=0, i=0, num_vecs=0, num_vecs_req=0;
+
+	// if device is in poll or legacy interrupt mode, exit early
+	if ((xdev->conf.qdma_drv_mode == POLL_MODE) || (xdev->conf.qdma_drv_mode == LEGACY_INTR_MODE)) goto exit;
+
+	// get the number of MSI-X vectors supported by the device PF
+	num_vecs = pci_msix_vec_count(xdev->conf.pdev);
+	pr_debug("dev %s, xdev->num_vecs = %d\n", dev_name(&xdev->conf.pdev->dev), xdev->num_vecs);
+	if (num_vecs == 0) {
+		pr_warn("MSI-X not supported, running in polled mode\n");
+		return 0;
+	}
+
+	// maximum available vectors allowed by configuration
+	xdev->num_vecs = min_t(int, num_vecs, xdev->conf.msix_qvec_max);
+	// total requested vectors = user vectors + data vectors (+ 1 error vector + 1 mailbox vector)
+	num_vecs_req = xdev->conf.user_msix_qvec_max + xdev->conf.data_msix_qvec_max;
+	// if master PF, 1 vector for error interrupt
+	if (xdev->conf.master_pf) num_vecs_req++; 
+	// if mailbox available, 1 vector for mailbox interrupt
+#ifndef MBOX_INTERRUPT_DISABLE
+	if (qdma_mbox_is_irq_availabe(xdev)) num_vecs_req++;
+#endif
+	// check if total requested vectors exceeds available vectors
+	if (num_vecs_req > xdev->num_vecs) {
+		pr_warn("Available vectors(%u) is less than Requested vectors(%u) [u:%u|d:%u]\n", xdev->num_vecs, num_vecs_req, xdev->conf.user_msix_qvec_max, xdev->conf.data_msix_qvec_max);
+		return -EINVAL;
+	}
+
+	// initialize MSI-X and interrupt information entries based on number of vectors
+	xdev->msix = kzalloc((sizeof(struct msix_entry) * xdev->num_vecs), GFP_KERNEL);
+	if (!xdev->msix) {
+		pr_err("dev %s xdev->msix OOM.\n", dev_name(&xdev->conf.pdev->dev));
+		rv = -ENOMEM;
+		goto exit;
+	}
+	xdev->dev_intr_info_list = kzalloc((sizeof(struct intr_info_t) * xdev->num_vecs), GFP_KERNEL);
+	if (!xdev->dev_intr_info_list) {
+		pr_err("dev %s xdev->dev_intr_info_list OOM.\n", dev_name(&xdev->conf.pdev->dev));
+		rv = -ENOMEM;
+		goto free_msix;
+	}
+	for (i = 0; i < xdev->num_vecs; i++) {
+		xdev->msix[i].entry = i;
+		INIT_LIST_HEAD(&xdev->dev_intr_info_list[i].intr_list);
+		spin_lock_init(&xdev->dev_intr_info_list[i].vec_q_list);
+	}
+
+	// enable MSI-X vectors based on kernel version
+#if KERNEL_VERSION(4, 12, 0) <= LINUX_VERSION_CODE
+	rv = pci_enable_msix_exact(xdev->conf.pdev, xdev->msix, xdev->num_vecs);
+#else
+	rv = pci_enable_msix(xdev->conf.pdev, xdev->msix, xdev->num_vecs);
+#endif
+	if (rv < 0) {
+		pr_err("Error enabling MSI-X (%d)\n", rv);
+		goto free_intr_info;
+	}
+
+	// initialize affinity mask
+	cpumask_var_t mask;
+	if (!zalloc_cpumask_var(&mask, GFP_KERNEL)) {
+		pr_err("Failed to allocate cpumask\n");
+		return -ENOMEM;
+	}
+	// example: bind all interrupts to CPU 11 only (interrupts can be bound to a subset of the available cores also)
+	int irq;
+	for (i = 0; i < xdev->num_vecs; i++) {
+		// get MSI-X vector 
+		irq = pci_irq_vector(xdev->conf.pdev, i); 
+		// set affinity mask for CPU 11
+		cpumask_clear(mask);
+		cpumask_set_cpu(11, mask); 
+		rv = irq_set_affinity_and_hint(irq, mask);
+		if (rv) pr_err("Failed to set affinity for vector %d\n", i);
+	}
+	free_cpumask_var(mask);
+
+	// initialize memory-mapped register pointers
+	if (mm_registers_init()) pr_err("Error when allocating memory mapped registers.");
+
+	// set up user interrupt vectors with different ISRs
+	i = 0;
+#ifndef USER_INTERRUPT_DISABLE
+	if (usr_intr_vector_init(xdev, i++, INTR_TYPE_USER_TOP)) goto cleanup_irq;
+	if (usr_intr_vector_init(xdev, i++, INTR_TYPE_USER_TASKLET)) goto cleanup_irq;
+	if (usr_intr_vector_init(xdev, i++, INTR_TYPE_USER_TASKLET_HIGHPRI)) goto cleanup_irq;
+	if (usr_intr_vector_init(xdev, i++, INTR_TYPE_USER_THREADED)) goto cleanup_irq;
+ 	if (usr_intr_vector_init(xdev, i++, INTR_TYPE_USER_WQ)) goto cleanup_irq;
+	if (usr_intr_vector_init(xdev, i++, INTR_TYPE_USER_WQ_UNBOUND)) goto cleanup_irq;
+	if (usr_intr_vector_init(xdev, i++, INTR_TYPE_USER_WQ_HIGHPRI)) goto cleanup_irq;
+	if (usr_intr_vector_init(xdev, i++, INTR_TYPE_USER_WQ_UNBOUND_HIGHPRI)) goto cleanup_irq;
+	// if (usr_intr_vector_init(xdev, i++, INTR_TYPE_USER_WQ_CPUINTENSIVE)) goto cleanup_irq;
+#endif
+
+	xdev->flags |= XDEV_FLAG_IRQ;
+	return 0;
+
+cleanup_irq: // free IRQs in case of failure
+	while (--i >= 0) free_irq(xdev->msix[i].vector, xdev);
+	pci_disable_msix(xdev->conf.pdev);
+	xdev->num_vecs = 0;
+
+free_intr_info:
+	kfree(xdev->dev_intr_info_list);
+
+free_msix:
+	kfree(xdev->msix); // free MSI-X entries
+
+exit:
+	return rv;
+}
+
+// Teardown function to clean up interrupt resources
+void intr_teardown(struct xlnx_dma_dev *xdev) {
+	int i = 7; // quick fix with with hardcoded number of vectors instead of xdev->num_vecs  
+	while (--i >= 0) free_irq(xdev->msix[i].vector, xdev);
+	if (xdev->num_vecs) pci_disable_msix(xdev->conf.pdev);
+	kfree(xdev->msix);
+	kfree(xdev->dev_intr_info_list);
+	// clean up ISR resources
+	usr_intr_vector_teardown(INTR_TYPE_USER_TOP);
+	usr_intr_vector_teardown(INTR_TYPE_USER_TASKLET);
+	usr_intr_vector_teardown(INTR_TYPE_USER_TASKLET_HIGHPRI);
+	usr_intr_vector_teardown(INTR_TYPE_USER_THREADED);
+	usr_intr_vector_teardown(INTR_TYPE_USER_WQ);
+	usr_intr_vector_teardown(INTR_TYPE_USER_WQ_UNBOUND);
+	usr_intr_vector_teardown(INTR_TYPE_USER_WQ_HIGHPRI);
+	usr_intr_vector_teardown(INTR_TYPE_USER_WQ_UNBOUND_HIGHPRI);
+	// usr_intr_vector_teardown(INTR_TYPE_USER_WQ_CPUINTENSIVE);
+	// tear down memory-mapped registers
+	mm_registers_teardown();
+}
+
+
+// The rest of the file is out of the scope of our thesis
+
 
 #ifndef __QDMA_VF__
 static LIST_HEAD(legacy_intr_q_list);
@@ -38,289 +455,6 @@ static spinlock_t legacy_intr_lock;
 static spinlock_t legacy_q_add_lock;
 static unsigned long legacy_intr_flags = IRQF_SHARED;
 #endif
-
-
-#ifndef __QDMA_VF__
-#ifdef DUMP_ON_ERROR_INTERRUPT
-#define REG_BANNER_LEN (81 * 5)
-static int dump_qdma_regs(struct xlnx_dma_dev *xdev)
-{
-	int len = 0, dis_len = 0;
-	int rv;
-	char *buf = NULL, *tbuff = NULL;
-	int buflen;
-	char temp_buf[512];
-
-	if (!xdev) {
-		pr_err("Invalid device\n");
-		return -EINVAL;
-	}
-
-	rv = qdma_reg_dump_buf_len((void *)xdev,
-			xdev->version_info.ip_type, &buflen);
-	if (rv < 0) {
-		pr_err("Failed to get reg dump buffer length\n");
-		return rv;
-	}
-	buflen += REG_BANNER_LEN;
-
-	/** allocate memory */
-	tbuff = (char *) kzalloc(buflen, GFP_KERNEL);
-	if (!tbuff)
-		return -ENOMEM;
-
-	buf = tbuff;
-	rv = qdma_dump_config_regs(xdev, buf + len, buflen - len);
-	if (rv < 0) {
-		pr_warn("Failed to dump Config Bar register values\n");
-		goto free_buf;
-	}
-	len += rv;
-
-	*data = buf;
-	*data_len = buflen;
-
-	buf[++len] = '\0';
-	memset(temp_buf, '\0', 512);
-	for (dis_len = 0; dis_len < len; dis_len += 512) {
-		memcpy(temp_buf, buf, 512);
-		pr_info("\n%s", temp_buf);
-		memset(temp_buf, '\0', 512);
-		buf += 512;
-	}
-
-free_buf:
-	kfree(tbuf);
-	return 0;
-}
-#endif
-#endif
-
-#ifndef MBOX_INTERRUPT_DISABLE
-static irqreturn_t mbox_intr_handler(int irq_index, int irq, void *dev_id)
-{
-	struct xlnx_dma_dev *xdev = dev_id;
-	struct qdma_mbox *mbox = &xdev->mbox;
-
-	pr_debug("Mailbox IRQ fired on Funtion#%d: index=%d, vector=%d\n",
-		xdev->func_id, irq_index, irq);
-
-	queue_work(mbox->workq, &mbox->rx_work);
-
-	return IRQ_HANDLED;
-}
-#endif
-
-#ifndef USER_INTERRUPT_DISABLE
-static irqreturn_t user_intr_handler(int irq_index, int irq, void *dev_id)
-{
-	struct xlnx_dma_dev *xdev = dev_id;
-
-	pr_debug("User IRQ fired on Funtion#%d: index=%d, vector=%d\n",
-		xdev->func_id, irq_index, irq);
-
-	if (xdev->conf.fp_user_isr_handler) {
-#ifndef __XRT__
-		xdev->conf.fp_user_isr_handler((unsigned long)xdev,
-						xdev->conf.uld);
-#else
-		xdev->conf.fp_user_isr_handler((unsigned long)xdev,
-						irq_index, xdev->conf.uld);
-#endif
-	}
-
-	return IRQ_HANDLED;
-}
-#endif
-
-#ifndef __QDMA_VF__
-static irqreturn_t error_intr_handler(int irq_index, int irq, void *dev_id)
-{
-	struct xlnx_dma_dev *xdev = dev_id;
-
-	pr_info("Error IRQ fired on Funtion#%d: index=%d, vector=%d\n",
-			xdev->func_id, irq_index, irq);
-
-	xdev->hw.qdma_hw_error_process(xdev);
-
-	xdev->hw.qdma_hw_error_intr_rearm(xdev);
-#ifdef DUMP_ON_ERROR_INTERRUPT
-	dump_qdma_regs(xdev);
-#endif
-	return IRQ_HANDLED;
-}
-#endif
-
-static void data_intr_aggregate(struct xlnx_dma_dev *xdev, int vidx, int irq,
-		u64 timestamp)
-{
-	struct qdma_descq *descq = NULL;
-	u32 counter = 0;
-	struct intr_coal_conf *coal_entry =
-			(xdev->intr_coal_list + vidx - xdev->dvec_start_idx);
-	union qdma_intr_ring *ring_entry;
-	struct qdma_intr_cidx_reg_info *intr_cidx_info;
-	uint8_t color = 0;
-	uint8_t intr_type = 0;
-	uint32_t qid = 0;
-	uint32_t num_entries_processed = 0;
-
-
-	if (!coal_entry) {
-		pr_err("Failed to locate the coalescing entry for vector = %d\n",
-			vidx);
-		return;
-	}
-	intr_cidx_info = &coal_entry->intr_cidx_info;
-	pr_debug("INTR_COAL: msix[%d].vector=%d, msix[%d].entry=%d, rngsize=%d, cidx = %d\n",
-		vidx, xdev->msix[vidx].vector,
-		vidx,
-		xdev->msix[vidx].entry,
-		coal_entry->intr_rng_num_entries,
-		intr_cidx_info->sw_cidx);
-
-	pr_debug("vidx = %d, dvec_start_idx = %d\n", vidx,
-		 xdev->dvec_start_idx);
-
-	if ((xdev->msix[vidx].entry) !=  coal_entry->vec_id) {
-		pr_err("msix[%d].entry[%d] != vec_id[%d]\n",
-			vidx, xdev->msix[vidx].entry,
-			coal_entry->vec_id);
-
-		return;
-	}
-
-	counter = intr_cidx_info->sw_cidx;
-	ring_entry = (coal_entry->intr_ring_base + counter);
-	if (!ring_entry) {
-		pr_err("Failed to locate the ring entry for vector = %d\n",
-			vidx);
-		return;
-	}
-
-	do {
-		if ((xdev->version_info.ip_type == QDMA_VERSAL_HARD_IP) &&
-				(xdev->version_info.device_type ==
-				 QDMA_DEVICE_VERSAL_CPM4)) {
-			color = ring_entry->ring_cpm.coal_color;
-			intr_type = ring_entry->ring_cpm.intr_type;
-			qid = ring_entry->ring_cpm.qid;
-		} else {
-			color = ring_entry->ring_generic.coal_color;
-			intr_type = ring_entry->ring_generic.intr_type;
-			qid = ring_entry->ring_generic.qid;
-		}
-
-		if (color != coal_entry->color)
-			break;
-		pr_debug("IRQ[%d]: IVE[%d], Qid = %d, e_color = %d, c_color = %d, intr_type = %d\n",
-				irq, vidx, qid, coal_entry->color,
-				color, intr_type);
-
-		descq = qdma_device_get_descq_by_hw_qid(xdev, qid,
-				intr_type);
-		if (!descq) {
-			pr_err("IRQ[%d]: IVE[%d], Qid = %d: desc not found\n",
-					irq, vidx, qid);
-			return;
-		}
-		xdev->prev_descq = descq;
-		pr_debug("IRQ[%d]: IVE[%d], Qid = %d, e_color = %d, c_color = %d, intr_type = %d\n",
-				irq, vidx, qid, coal_entry->color,
-				color, intr_type);
-
-		if (descq->conf.ping_pong_en &&
-			descq->conf.q_type == Q_C2H && descq->conf.st)
-			descq->ping_pong_rx_time = timestamp;
-
-		if (descq->conf.fp_descq_isr_top) {
-			descq->conf.fp_descq_isr_top(descq->q_hndl,
-					descq->conf.quld);
-		} else {
-			if (descq->cpu_assigned)
-				schedule_work_on(descq->intr_work_cpu,
-						&descq->work);
-			else
-				schedule_work(&descq->work);
-		}
-
-		if (++intr_cidx_info->sw_cidx ==
-				coal_entry->intr_rng_num_entries) {
-			counter = 0;
-			xdev->intr_coal_list->color =
-				(xdev->intr_coal_list->color) ? 0 : 1;
-			intr_cidx_info->sw_cidx = 0;
-		} else
-			counter++;
-		num_entries_processed++;
-		ring_entry = (coal_entry->intr_ring_base + counter);
-	} while (1);
-
-	if (descq) {
-		queue_intr_cidx_update(descq->xdev,
-			descq->conf.qidx, &coal_entry->intr_cidx_info);
-	} else if (num_entries_processed == 0) {
-		pr_debug("No entries processed\n");
-		descq = xdev->prev_descq;
-		if (descq) {
-			pr_debug("Doing stale update\n");
-			queue_intr_cidx_update(descq->xdev,
-				descq->conf.qidx, &coal_entry->intr_cidx_info);
-		}
-	}
-
-}
-
-static void data_intr_direct(struct xlnx_dma_dev *xdev, int vidx, int irq,
-			u64 timestamp)
-{
-	struct qdma_descq *descq;
-	unsigned long flags;
-	struct list_head *descq_list =
-			&xdev->dev_intr_info_list[vidx].intr_list;
-	struct list_head *entry, *tmp;
-
-	spin_lock_irqsave(&xdev->dev_intr_info_list[vidx].vec_q_list,
-			  flags);
-	list_for_each_safe(entry, tmp, descq_list) {
-		descq = container_of(entry, struct qdma_descq, intr_list);
-
-		if (descq->conf.ping_pong_en &&
-				descq->conf.q_type == Q_C2H && descq->conf.st)
-			descq->ping_pong_rx_time = timestamp;
-
-		if (descq->conf.fp_descq_isr_top) {
-			descq->conf.fp_descq_isr_top(descq->q_hndl,
-					descq->conf.quld);
-		} else {
-			if (descq->cpu_assigned)
-				schedule_work_on(descq->intr_work_cpu,
-						&descq->work);
-			else
-				schedule_work(&descq->work);
-		}
-	}
-	spin_unlock_irqrestore(&xdev->dev_intr_info_list[vidx].vec_q_list,
-			    flags);
-}
-
-static irqreturn_t data_intr_handler(int vector_index, int irq, void *dev_id)
-{
-	struct xlnx_dma_dev *xdev = dev_id;
-	u64 timestamp;
-
-	pr_debug("%s: Data IRQ fired on Funtion#%05x: index=%d, vector=%d\n",
-		xdev->mod_name, xdev->func_id, vector_index, irq);
-	timestamp = rdtsc_gettime();
-
-	if ((xdev->conf.qdma_drv_mode == INDIRECT_INTR_MODE) ||
-			(xdev->conf.qdma_drv_mode == AUTO_MODE))
-		data_intr_aggregate(xdev, vector_index, irq, timestamp);
-	else
-		data_intr_direct(xdev, vector_index, irq, timestamp);
-
-	return IRQ_HANDLED;
-}
 
 static inline void intr_ring_free(struct xlnx_dma_dev *xdev, int ring_sz,
 			int intr_desc_sz, u8 *intr_desc, dma_addr_t desc_bus)
@@ -433,109 +567,6 @@ void intr_ring_teardown(struct xlnx_dma_dev *xdev)
 	kfree(xdev->intr_coal_list);
 }
 
-static void data_vector_handler(int irq, struct xlnx_dma_dev *xdev)
-{
-	int i;
-
-	for (i = 0; i < xdev->num_vecs; i++) {
-		if (xdev->msix[i].vector == irq) {
-			xdev->dev_intr_info_list[i].intr_vec_map.intr_handler(i,
-					irq, (void *)xdev);
-			break;
-		}
-	}
-}
-
-static irqreturn_t irq_bottom(int irq, void *dev_id)
-{
-	struct xlnx_dma_dev *xdev = dev_id;
-
-	data_vector_handler(irq, xdev);
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t irq_top(int irq, void *dev_id)
-{
-	struct xlnx_dma_dev *xdev = dev_id;
-
-	if (xdev->conf.fp_q_isr_top_dev) {
-		xdev->conf.fp_q_isr_top_dev((unsigned long)xdev,
-					xdev->conf.uld);
-	}
-
-	return IRQ_WAKE_THREAD;
-}
-
-
-void intr_teardown(struct xlnx_dma_dev *xdev)
-{
-	int i = xdev->num_vecs;
-
-	while (--i >= 0)
-		free_irq(xdev->msix[i].vector, xdev);
-
-	if (xdev->num_vecs)
-		pci_disable_msix(xdev->conf.pdev);
-
-	kfree(xdev->msix);
-	kfree(xdev->dev_intr_info_list);
-}
-
-
-static int intr_vector_setup(struct xlnx_dma_dev *xdev, int idx,
-			enum intr_type_list type, f_intr_handler handler)
-{
-	int rv;
-
-	if (type == INTR_TYPE_ERROR)
-		snprintf(xdev->dev_intr_info_list[idx].msix_name,
-			 QDMA_DEV_NAME_MAXLEN + 16, "%s-error",
-			 xdev->conf.name);
-
-	if (type == INTR_TYPE_USER)
-#ifndef USER_INTERRUPT_DISABLE
-		snprintf(xdev->dev_intr_info_list[idx].msix_name,
-			 QDMA_DEV_NAME_MAXLEN + 16, "%s-user", xdev->conf.name);
-#else
-		return -EINVAL;
-#endif
-	if (type == INTR_TYPE_DATA)
-		snprintf(xdev->dev_intr_info_list[idx].msix_name,
-			 QDMA_DEV_NAME_MAXLEN + 16, "%s-data", xdev->conf.name);
-	if (type == INTR_TYPE_MBOX)
-#ifndef MBOX_INTERRUPT_DISABLE
-		snprintf(xdev->dev_intr_info_list[idx].msix_name,
-			 QDMA_DEV_NAME_MAXLEN + 16, "%s-mbox", xdev->conf.name);
-#else
-		return -EINVAL;
-#endif
-
-	xdev->dev_intr_info_list[idx].intr_vec_map.intr_type = type;
-	xdev->dev_intr_info_list[idx].intr_vec_map.intr_vec_index = idx;
-	xdev->dev_intr_info_list[idx].intr_vec_map.intr_handler = handler;
-
-	if ((type == INTR_TYPE_DATA) || (type == INTR_TYPE_MBOX)) {
-		rv = request_irq(xdev->msix[idx].vector, irq_bottom, 0,
-				 xdev->dev_intr_info_list[idx].msix_name, xdev);
-	} else
-		rv = request_threaded_irq(xdev->msix[idx].vector, irq_top,
-					  irq_bottom, 0,
-				  xdev->dev_intr_info_list[idx].msix_name,
-				  xdev);
-
-	pr_debug("%s requesting IRQ vector #%d: vec %d, type %d, %s.\n",
-			xdev->conf.name, idx, xdev->msix[idx].vector,
-			type, xdev->dev_intr_info_list[idx].msix_name);
-
-	if (rv) {
-		pr_err("%s requesting IRQ vector #%d: vec %d failed %d.\n",
-			xdev->conf.name, idx, xdev->msix[idx].vector, rv);
-		return rv;
-	}
-
-	return 0;
-}
 #ifdef __PCI_MSI_VEC_COUNT__
 
 #define msix_table_size(flags)	((flags & PCI_MSIX_FLAGS_QSIZE) + 1)
@@ -552,175 +583,19 @@ static int pci_msix_vec_count(struct pci_dev *dev)
 }
 #endif
 
-int intr_setup(struct xlnx_dma_dev *xdev)
-{
-	int rv = 0;
-	int i = 0;
-	int num_vecs = 0;
-	int num_vecs_req = 0;
-#ifndef USER_INTERRUPT_DISABLE
-	int intr_count = 0;
-#endif
-
-	if ((xdev->conf.qdma_drv_mode == POLL_MODE) ||
-			(xdev->conf.qdma_drv_mode == LEGACY_INTR_MODE)) {
-		goto exit;
-	}
-	num_vecs = pci_msix_vec_count(xdev->conf.pdev);
-	pr_debug("dev %s, xdev->num_vecs = %d\n",
-			dev_name(&xdev->conf.pdev->dev), xdev->num_vecs);
-
-	if (num_vecs == 0) {
-		pr_warn("MSI-X not supported, running in polled mode\n");
-		return 0;
-	}
-
-	if (xdev->conf.data_msix_qvec_max == 0) {
-		pr_err("At least 1 data vector is required. input invalid: data_masix_qvec_max(%u)",
-			xdev->conf.data_msix_qvec_max);
-		return -EINVAL;
-	}
-
-	xdev->num_vecs = min_t(int, num_vecs, xdev->conf.msix_qvec_max);
-	if (xdev->num_vecs < xdev->conf.msix_qvec_max)
-		pr_info("current device supports only (%u) msix vectors per function. ignoring input for (%u) vectors",
-			xdev->num_vecs,
-			xdev->conf.msix_qvec_max);
-
-	/** Make sure the total supported vectors =
-	 *  (user vectors + data vectors + 1 error vectors
-	 *  + 1 mailbox vectors)
-	 *  find the requested vectors and check the available vectors
-	 *  can satisfy the request
-	 */
-	num_vecs_req = xdev->conf.user_msix_qvec_max +
-					xdev->conf.data_msix_qvec_max;
-
-	/** Dedicate 1 vector for error interrupts */
-	if (xdev->conf.master_pf)
-		num_vecs_req++;
-
-#ifndef MBOX_INTERRUPT_DISABLE
-	/** Dedicate 1 vector for mailbox interrupts */
-	if (qdma_mbox_is_irq_availabe(xdev))
-		num_vecs_req++;
-#endif
-
-	if (num_vecs_req > xdev->num_vecs) {
-		pr_warn("Available vectors(%u) is less than Requested vectors(%u) [u:%u|d:%u]\n",
-				xdev->num_vecs,
-				num_vecs_req,
-				xdev->conf.user_msix_qvec_max,
-				xdev->conf.data_msix_qvec_max);
-		return -EINVAL;
-	}
-
-	xdev->msix = kzalloc((sizeof(struct msix_entry) * xdev->num_vecs),
-						GFP_KERNEL);
-	if (!xdev->msix) {
-		pr_err("dev %s xdev->msix OOM.\n",
-			dev_name(&xdev->conf.pdev->dev));
-		rv = -ENOMEM;
-		goto exit;
-	}
-
-	xdev->dev_intr_info_list =
-			kzalloc((sizeof(struct intr_info_t) * xdev->num_vecs),
-					GFP_KERNEL);
-	if (!xdev->dev_intr_info_list) {
-		pr_err("dev %s xdev->dev_intr_info_list OOM.\n",
-			dev_name(&xdev->conf.pdev->dev));
-		rv = -ENOMEM;
-		goto free_msix;
-	}
-
-	for (i = 0; i < xdev->num_vecs; i++) {
-		xdev->msix[i].entry = i;
-		INIT_LIST_HEAD(&xdev->dev_intr_info_list[i].intr_list);
-		spin_lock_init(&xdev->dev_intr_info_list[i].vec_q_list);
-	}
-
-#if KERNEL_VERSION(4, 12, 0) <= LINUX_VERSION_CODE
-	rv = pci_enable_msix_exact(xdev->conf.pdev, xdev->msix, xdev->num_vecs);
-#else
-	rv = pci_enable_msix(xdev->conf.pdev, xdev->msix, xdev->num_vecs);
-#endif
-	if (rv < 0) {
-		pr_err("Error enabling MSI-X (%d)\n", rv);
-		goto free_intr_info;
-	}
-
-	/** On master PF0, vector#2 is dedicated for Error interrupts and
-	 * vector #1 is dedicated for User interrupts
-	 * For all other PFs and VFs, vector#0 is dedicated for User interrupts
-	 * The remaining vectors are for Data interrupts
-	 */
-	i = 0; /* This is mandatory, do not delete */
-
-#ifndef MBOX_INTERRUPT_DISABLE
-	if (qdma_mbox_is_irq_availabe(xdev)) {
-		/* Mail box interrupt */
-		rv = intr_vector_setup(xdev, i, INTR_TYPE_MBOX,
-				mbox_intr_handler);
-		if (rv)
-			goto cleanup_irq;
-		i++;
-	}
-#endif
-
-#ifndef USER_INTERRUPT_DISABLE
-	for (intr_count = 0;
-		intr_count < xdev->conf.user_msix_qvec_max;
-		intr_count++) {
-		/* user interrupt */
-		rv = intr_vector_setup(xdev, i, INTR_TYPE_USER,
-				user_intr_handler);
-		if (rv)
-			goto cleanup_irq;
-		i++;
-	}
-#endif
-
 #ifndef __QDMA_VF__
-	/* global error interrupt */
-	if (xdev->conf.master_pf) {
-		rv = intr_vector_setup(xdev, i, INTR_TYPE_ERROR,
-				error_intr_handler);
-		if (rv)
-			goto cleanup_irq;
-		i++;
-	}
-#endif
+static irqreturn_t irq_top(int irq, void *dev_id)
+{
+	struct xlnx_dma_dev *xdev = dev_id;
 
-	/* data interrupt */
-	xdev->dvec_start_idx = i;
-	for (; i < xdev->num_vecs; i++) {
-		rv = intr_vector_setup(xdev, i, INTR_TYPE_DATA,
-					data_intr_handler);
-		if (rv)
-			goto cleanup_irq;
+	if (xdev->conf.fp_q_isr_top_dev) {
+		xdev->conf.fp_q_isr_top_dev((unsigned long)xdev,
+					xdev->conf.uld);
 	}
 
-	xdev->flags |= XDEV_FLAG_IRQ;
-	return rv;
-
-cleanup_irq:
-	while (--i >= 0)
-		free_irq(xdev->msix[i].vector, xdev);
-
-	pci_disable_msix(xdev->conf.pdev);
-	xdev->num_vecs = 0;
-free_intr_info:
-	kfree(xdev->dev_intr_info_list);
-free_msix:
-	kfree(xdev->msix);
-exit:
-	return rv;
+	return IRQ_WAKE_THREAD;
 }
 
-
-
-#ifndef __QDMA_VF__
 static irqreturn_t irq_legacy(int irq, void *irq_data)
 {
 	struct list_head *entry, *tmp;
@@ -932,14 +807,6 @@ err_out:
 	return -ENOMEM;
 }
 
-void intr_work(struct work_struct *work)
-{
-	struct qdma_descq *descq;
-
-	descq = container_of(work, struct qdma_descq, work);
-	qdma_descq_service_cmpl_update(descq, 0, 1);
-}
-
 /**
  * qdma_queue_service - service the queue
  * in the case of irq handler is registered by the user, the user should
@@ -1021,4 +888,12 @@ void intr_legacy_init(void)
 #ifndef __QDMA_VF__
 	spin_lock_init(&legacy_q_add_lock);
 #endif
+}
+
+void intr_work(struct work_struct *work)
+{
+	struct qdma_descq *descq;
+
+	descq = container_of(work, struct qdma_descq, work);
+	qdma_descq_service_cmpl_update(descq, 0, 1);
 }

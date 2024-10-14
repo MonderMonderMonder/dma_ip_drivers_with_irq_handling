@@ -95,18 +95,6 @@ enum qdma_pf_devices {
  */
 #define QDMA_DESC_BLEN_MAX	((1 << (QDMA_DESC_BLEN_BITS)) - 1)
 
-#ifdef __XRT__
-/**
- * number of bits to describe the SOFT DMA transfer descriptor
- */
-#define SOFT_QDMA_DESC_BLEN_BITS   15
-
-/**
- * maximum size of a single SOFT DMA transfer descriptor
- */
-#define SOFT_QDMA_DESC_BLEN_MAX      (1 << (SOFT_QDMA_DESC_BLEN_BITS))
-#endif
-
 /**
  * obtain the 32 most significant (high) bits of a 32-bit or 64-bit address
  */
@@ -178,11 +166,26 @@ struct intr_coal_conf {
  * intr_type_list - interrupt types
  */
 enum intr_type_list {
-	INTR_TYPE_ERROR,	/**< error interrupt */
-	INTR_TYPE_USER,		/**< user interrupt */
-	INTR_TYPE_DATA,		/**< data interrupt */
-	INTR_TYPE_MBOX,		/**< mail box interrupt */
-	INTR_TYPE_MAX		/**< max interrupt */
+	INTR_TYPE_ERROR,			/**< error interrupt */
+
+	INTR_TYPE_USER_TOP,
+	INTR_TYPE_USER_THREADED,
+	INTR_TYPE_USER_TASKLET,
+	INTR_TYPE_USER_TASKLET_HIGHPRI,
+	INTR_TYPE_USER_WQ,
+	INTR_TYPE_USER_WQ_UNBOUND,
+	INTR_TYPE_USER_WQ_HIGHPRI,
+	INTR_TYPE_USER_WQ_UNBOUND_HIGHPRI,
+	INTR_TYPE_USER_WQ_CPUINTENSIVE,
+
+	INTR_TYPE_USER_WQ_BH,
+	INTR_TYPE_USER_WQ_BH_HIGHPRI,
+
+	INTR_TYPE_USER_WQ_UNBOUND_AFFNT_CPU_STRICT,
+	INTR_TYPE_USER_WQ_UNBOUND_AFFNT_SMT_STRICT,
+	INTR_TYPE_USER_WQ_UNBOUND_AFFNT_CACHE_STRICT,
+	INTR_TYPE_USER_WQ_UNBOUND_AFFNT_NUMA_STRICT,
+	INTR_TYPE_USER_WQ_ORDERED,
 };
 
 /**
